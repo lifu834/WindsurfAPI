@@ -41,3 +41,6 @@ stats.json
 package-lock.json
 *.png
 .docker-data/
+*.bak
+.env*
+accounts.json*
