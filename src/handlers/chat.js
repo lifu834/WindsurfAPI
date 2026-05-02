@@ -1233,8 +1233,9 @@ export async function handleChatCompletions(body, context = {}) {
     // P3: Dynamic preamble budget — compute available headroom based on
     // actual system prompt size instead of fixed 24KB soft cap.
     // Panel-state total ~55KB; subtract sysPrompt + callerEnv + safety margin.
-    const PANEL_STATE_TOTAL = parseInt(process.env.PANEL_STATE_TOTAL_BYTES || '55000', 10);
+    const PANEL_STATE_TOTAL = parseInt(process.env.PANEL_STATE_TOTAL_BYTES || '80000', 10);
     const SAFETY_MARGIN = 2000;
+    const MIN_PREAMBLE_FLOOR = 4000; // P6: minimum preamble budget — names-only with <4KB is useless
     const _sysBytes = (messages || []).filter(m => m?.role === 'system').reduce((n, m) => {
       const c = m?.content;
       return n + Buffer.byteLength(typeof c === 'string' ? c : JSON.stringify(c || ''), 'utf8');
@@ -1242,7 +1243,7 @@ export async function handleChatCompletions(body, context = {}) {
     const _envBytes = Buffer.byteLength(callerEnv || '', 'utf8');
     const _available = PANEL_STATE_TOTAL - _sysBytes - _envBytes - SAFETY_MARGIN;
     const _defaultSoft = parseInt(process.env.TOOL_PREAMBLE_SOFT_BYTES || '24000', 10);
-    const dynamicSoftBytes = Math.max(0, Math.min(_available, _defaultSoft));
+    const dynamicSoftBytes = Math.max(MIN_PREAMBLE_FLOOR, Math.min(_available, _defaultSoft));
     if (dynamicSoftBytes !== _defaultSoft) {
       log.info(`Chat[${reqId}]: P3 dynamic budget: sys=${Math.round(_sysBytes/1024)}KB env=${Math.round(_envBytes/1024)}KB available=${Math.round(_available/1024)}KB softBytes=${Math.round(dynamicSoftBytes/1024)}KB`);
     }
