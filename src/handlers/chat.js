@@ -27,6 +27,7 @@ import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.
 import { registerSseController } from '../sse-registry.js';
 
 const HEARTBEAT_MS = 15_000;
+const TOOL_BUFFER_MODE_THRESHOLD = parseInt(process.env.TOOL_BUFFER_MODE_THRESHOLD || '50', 10);
 const QUEUE_RETRY_MS = 1_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
 
@@ -1413,6 +1414,7 @@ export async function handleChatCompletions(body, context = {}) {
       wantThinking,
       fpOpts: buildReuseOpts({ tools, toolChoice: tool_choice, toolPreamble, preambleTier, emulateTools, route: body.__route || 'chat' }),
       tools,
+      preambleTier,
     });
   }
 
@@ -2084,6 +2086,20 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
       let pathStreamText = new PathSanitizeStream();
       let pathStreamThinking = new PathSanitizeStream();
 
+      // P2: Buffer mode — when tool count is high or preamble was degraded,
+      // hold all text/tool_call output until the Cascade response is complete.
+      // Then parse tool_calls from the full accumulated text with the robust
+      // parseToolCallsFromText extractor (independent of streaming state machine).
+      // This prevents raw <tool_call> markup from leaking to the client.
+      const preambleTier = deps.preambleTier || null;
+      const bufferMode = emulateTools && (
+        declaredTools.length >= TOOL_BUFFER_MODE_THRESHOLD ||
+        (preambleTier && preambleTier !== 'full')
+      );
+      if (bufferMode) {
+        log.info(`Chat[stream]: buffer mode enabled (tools=${declaredTools.length} tier=${preambleTier || 'full'})`);
+      }
+
       const emitContent = (clean) => {
         if (!clean) return;
         accText += clean;
@@ -2092,6 +2108,9 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
         // middle of a stream (fence might straddle a chunk, and we'd need
         // lookahead). On finish we'll emit one clean JSON payload.
         if (wantJson) return;
+        // P2: In buffer mode, accumulate but don't send yet — we'll emit
+        // everything after the response is complete and tool_calls are parsed.
+        if (bufferMode) return;
         send({ id, object: 'chat.completion.chunk', created, model,
           choices: [{ index: 0, delta: { content: clean }, finish_reason: null }] });
       };
@@ -2368,6 +2387,54 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             }
             emitContent(pathStreamText.flush());
             emitThinking(pathStreamThinking.flush());
+
+            // P2: Buffer mode flush — now that the response is complete and
+            // tool_calls have been collected (including P1 salvage recovery),
+            // emit all buffered content as SSE events.
+            if (bufferMode && !res.writableEnded) {
+              // Re-parse accText for tool_calls if streaming parser found none
+              if (emulateTools && collectedToolCalls.length === 0 && accText) {
+                const bufferParsed = parseToolCallsFromText(accText, { modelKey, provider });
+                const bufferFiltered = filterToolCallsByAllowlist(bufferParsed.toolCalls, declaredTools);
+                if (bufferFiltered.length > 0) {
+                  log.info(`Chat[stream-buffer]: recovered ${bufferFiltered.length} tool_call(s) from buffered text`);
+                  for (const rawTc of bufferFiltered) {
+                    const tc = sanitizeToolCall(repairToolCallArguments(rawTc, messages));
+                    collectedToolCalls.push(tc);
+                  }
+                  accText = stripToolMarkupFromText(accText);
+                }
+              }
+              // Emit role header if not yet printed
+              if (!rolePrinted) {
+                rolePrinted = true;
+                send({ id, object: 'chat.completion.chunk', created, model,
+                  choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+              }
+              // Emit thinking if any
+              if (accThinking) {
+                send({ id, object: 'chat.completion.chunk', created, model,
+                  choices: [{ index: 0, delta: { reasoning_content: accThinking }, finish_reason: null }] });
+              }
+              // Emit clean text content (stripped of tool markup)
+              if (accText) {
+                send({ id, object: 'chat.completion.chunk', created, model,
+                  choices: [{ index: 0, delta: { content: accText }, finish_reason: null }] });
+              }
+              // Emit tool_calls
+              for (let i = 0; i < collectedToolCalls.length; i++) {
+                const tc = collectedToolCalls[i];
+                send({ id, object: 'chat.completion.chunk', created, model,
+                  choices: [{ index: 0, delta: {
+                    tool_calls: [{
+                      index: i,
+                      id: tc.id,
+                      type: 'function',
+                      function: { name: tc.name, arguments: sanitizeText(tc.argumentsJson || '{}') },
+                    }],
+                  }, finish_reason: null }] });
+              }
+            }
             // Pool check-in on success (cascade only)
             if (reuseEnabled && cascadeResult?.cascadeId && (accText || collectedToolCalls.length)) {
               const turnComplete = appendAssistantTurn(messages, accText, collectedToolCalls);
