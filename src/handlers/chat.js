@@ -2330,6 +2330,40 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 if (/\{\s*"name"\s*:\s*"[a-zA-Z0-9_-]+"\s*,\s*"arguments"/.test(accText)) markers.push('bare_json');
                 if (/^\s*(?:I'?ll|I will|Let me|I'?m going to)\s+(?:call|use|invoke|run)/im.test(accText)) markers.push('natural_lang');
                 log.info(`Chat[stream]: emulateTools=true but parser found 0 tool_calls (model=${modelKey} provider=${provider}); markers=${markers.join(',') || 'none'}; head="${head}"`);
+                // P1: Stream-path salvage — re-parse accumulated text with
+                // the full-text extractor (parseToolCallsFromText includes
+                // salvageToolCallsFromText which is independent of the
+                // streaming state machine). This catches tool_calls that the
+                // streaming parser missed due to chunk-boundary issues or
+                // degraded preamble causing format deviations.
+                // IMPORTANT: this only helps if the raw markup has NOT yet
+                // been flushed to the client. In streaming mode the text is
+                // already sent, so we emit the recovered tool_calls as
+                // additional content_block events AFTER the text — the client
+                // sees text first, then tool_use blocks, which is valid
+                // Anthropic SSE ordering (text content_block → tool_use
+                // content_block within the same message).
+                if (markers.length > 0) {
+                  const salvageResult = parseToolCallsFromText(accText, {
+                    modelKey, provider,
+                    dialect: undefined,  // let it auto-detect
+                  });
+                  const salvaged = filterToolCallsByAllowlist(
+                    salvageResult.toolCalls, tools
+                  );
+                  if (salvaged.length > 0) {
+                    log.info(`Chat[stream]: salvage recovered ${salvaged.length} tool_call(s) from accumulated text`);
+                    for (const rawTc of salvaged) {
+                      const tc = sanitizeToolCall(repairToolCallArguments(rawTc, messages));
+                      const idx = collectedToolCalls.length;
+                      collectedToolCalls.push(tc);
+                      emitToolCallDelta(tc, idx);
+                    }
+                    // Update accText to strip the tool markup so the final
+                    // text content is clean
+                    accText = stripToolMarkupFromText(accText);
+                  }
+                }
               }
             }
             emitContent(pathStreamText.flush());
