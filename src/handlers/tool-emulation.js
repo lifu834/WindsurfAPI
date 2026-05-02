@@ -493,6 +493,68 @@ export function buildSkinnyToolPreambleForProto(tools, toolChoice, environment, 
  * because the alternative is the request failing with panel_state_missing
  * retries until the proxy gives up.
  */
+
+/**
+ * P4: Complexity-aware hybrid preamble.
+ * Tier A (full schema):     Tools with nested object/array parameters
+ * Tier B (skinny signature): Simple flat-parameter tools
+ * Tier C (names-only):      Remaining tools (lowest priority)
+ *
+ * This maximizes schema quality for complex tools (TodoWrite, Task, etc.)
+ * within the preamble budget, while still listing all tools by name.
+ */
+const FORCED_TIER_A = new Set(
+  (process.env.CORE_TOOLS || '').split(',').map(s => s.trim()).filter(Boolean)
+);
+
+function classifyToolComplexity(tool) {
+  const name = tool?.function?.name || '';
+  if (FORCED_TIER_A.has(name)) return 'A';
+  const schema = tool?.function?.parameters;
+  if (!schema) return 'C';
+  const schemaStr = JSON.stringify(schema);
+  // Nested object/array → must keep full schema
+  if (schemaStr.includes('"type":"array"') || schemaStr.includes('"type": "array"')) return 'A';
+  if ((schemaStr.match(/"type"\s*:\s*"object"/g) || []).length > 1) return 'A';
+  // 3+ params or enums → skinny signature
+  const paramCount = Object.keys(schema.properties || {}).length;
+  if (paramCount >= 3 || schemaStr.includes('"enum"')) return 'B';
+  return 'C';
+}
+
+export function buildComplexityAwareToolPreamble(tools, toolChoice, environment, modelKey = null, provider = null) {
+  if (!Array.isArray(tools) || tools.length === 0) return '';
+  const tierA = [];
+  const tierB = [];
+  const tierC = [];
+  for (const t of tools) {
+    const tier = classifyToolComplexity(t);
+    if (tier === 'A') tierA.push(t);
+    else if (tier === 'B') tierB.push(t);
+    else tierC.push(t);
+  }
+  // Build Tier A with schema-compact (full types, stripped docs)
+  const partA = buildSchemaCompactToolPreambleForProto(tierA, toolChoice, environment, modelKey, provider);
+  // Build Tier B with skinny (name + param signature)
+  const partB = tierB.length ? buildSkinnyToolPreambleForProto(tierB, 'auto', '', modelKey, provider) : '';
+  // Build Tier C with names-only
+  const namesC = tierC.map(t => t?.function?.name).filter(Boolean);
+  const partC = namesC.length
+    ? `\nAdditional tools (parameter schemas omitted): ${namesC.join(', ')}.`
+    : '';
+  // Combine — partA already has protocol header + environment, so strip
+  // duplicate headers from partB
+  let combined = partA;
+  if (partB) {
+    // Extract just the tool list from partB (skip duplicate protocol header)
+    const toolListMatch = partB.match(/Available functions[\s\S]*/);
+    if (toolListMatch) combined += '\n\n' + toolListMatch[0];
+  }
+  if (partC) combined += partC;
+  if (!combined) return buildCompactToolPreambleForProto(tools, toolChoice, environment, modelKey, provider);
+  return combined;
+}
+
 export function buildCompactToolPreambleForProto(tools, toolChoice, environment, modelKey = null, provider = null) {
   if (!Array.isArray(tools) || tools.length === 0) return '';
   const { mode, forceName } = resolveToolChoice(toolChoice);

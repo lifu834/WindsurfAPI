@@ -22,11 +22,13 @@ import {
   normalizeMessagesForCascade, ToolCallStreamParser, parseToolCallsFromText, stripToolMarkupFromText,
   buildToolPreambleForProto, buildCompactToolPreambleForProto,
   buildSchemaCompactToolPreambleForProto, buildSkinnyToolPreambleForProto,
+  buildComplexityAwareToolPreamble,
 } from './tool-emulation.js';
 import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.js';
 import { registerSseController } from '../sse-registry.js';
 
 const HEARTBEAT_MS = 15_000;
+const CONTEXT_PRESSURE = parseFloat(process.env.CONTEXT_PRESSURE || '1.0');
 const TOOL_BUFFER_MODE_THRESHOLD = parseInt(process.env.TOOL_BUFFER_MODE_THRESHOLD || '50', 10);
 const QUEUE_RETRY_MS = 1_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
@@ -928,7 +930,7 @@ function cachedUsage(messages, completionText) {
     prompt_tokens: prompt,
     completion_tokens: completion,
     total_tokens: prompt + completion,
-    input_tokens: prompt,
+    input_tokens: CONTEXT_PRESSURE !== 1.0 ? Math.ceil(prompt * CONTEXT_PRESSURE) : prompt, // P5: context pressure inflation
     output_tokens: completion,
     prompt_tokens_details: { cached_tokens: prompt },
     completion_tokens_details: { reasoning_tokens: 0 },
@@ -944,6 +946,7 @@ export function applyToolPreambleBudget(tools, toolChoice, callerEnv = '', opts 
   const tiers = [
     { tier: 'full', build: buildToolPreambleForProto },
     { tier: 'schema-compact', build: buildSchemaCompactToolPreambleForProto },
+    { tier: 'hybrid', build: buildComplexityAwareToolPreamble },
     { tier: 'skinny', build: buildSkinnyToolPreambleForProto },
     { tier: 'names-only', build: buildCompactToolPreambleForProto },
   ];
@@ -1034,7 +1037,7 @@ function buildUsageBody(serverUsage, messages, completionText, thinkingText = ''
     prompt_tokens: prompt,
     completion_tokens: completion,
     total_tokens: prompt + completion,
-    input_tokens: prompt,
+    input_tokens: CONTEXT_PRESSURE !== 1.0 ? Math.ceil(prompt * CONTEXT_PRESSURE) : prompt, // P5: context pressure inflation
     output_tokens: completion,
     prompt_tokens_details: { cached_tokens: 0 },
     completion_tokens_details: { reasoning_tokens: 0 },
@@ -1227,9 +1230,26 @@ export async function handleChatCompletions(body, context = {}) {
   // hard cap; v2.0.9 rejected on the full-schema size before compacting,
   // which broke real opencode / Claude Code setups with 30-50 MCP tools.
   if (emulateTools) {
+    // P3: Dynamic preamble budget — compute available headroom based on
+    // actual system prompt size instead of fixed 24KB soft cap.
+    // Panel-state total ~55KB; subtract sysPrompt + callerEnv + safety margin.
+    const PANEL_STATE_TOTAL = parseInt(process.env.PANEL_STATE_TOTAL_BYTES || '55000', 10);
+    const SAFETY_MARGIN = 2000;
+    const _sysBytes = (messages || []).filter(m => m?.role === 'system').reduce((n, m) => {
+      const c = m?.content;
+      return n + Buffer.byteLength(typeof c === 'string' ? c : JSON.stringify(c || ''), 'utf8');
+    }, 0);
+    const _envBytes = Buffer.byteLength(callerEnv || '', 'utf8');
+    const _available = PANEL_STATE_TOTAL - _sysBytes - _envBytes - SAFETY_MARGIN;
+    const _defaultSoft = parseInt(process.env.TOOL_PREAMBLE_SOFT_BYTES || '24000', 10);
+    const dynamicSoftBytes = Math.max(0, Math.min(_available, _defaultSoft));
+    if (dynamicSoftBytes !== _defaultSoft) {
+      log.info(`Chat[${reqId}]: P3 dynamic budget: sys=${Math.round(_sysBytes/1024)}KB env=${Math.round(_envBytes/1024)}KB available=${Math.round(_available/1024)}KB softBytes=${Math.round(dynamicSoftBytes/1024)}KB`);
+    }
     const budget = applyToolPreambleBudget(tools || [], tool_choice, callerEnv, {
       modelKey: routingModelKey,
       provider: modelInfo?.provider || null,
+      softBytes: dynamicSoftBytes,
     });
     preambleTier = budget.tier;
     if (budget.compacted) {
